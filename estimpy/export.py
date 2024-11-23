@@ -1,16 +1,45 @@
+import ctypes
 import datetime
+import itertools
 import math
+import os
+import subprocess
+import sys
+import threading
+import time
 
 import matplotlib
 import matplotlib.pyplot
-import os
-import subprocess
-import time
 
 import estimpy as es
 
 _DPI = 8
 
+def enable_windows_virtual_terminal():
+    '''
+    This is needed to enable multiline progress bar as it is needed for ANSI escape code support in plain Windows CMD
+    '''
+    if os.name == 'nt':  # Only apply to Windows
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE = -11
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        mode.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        kernel32.SetConsoleMode(handle, mode)
+
+def spinner(stop_event):
+    '''
+    Fun spinny progress indicator
+    '''
+    spinner  = ["|", "/", "-", "\\"]
+    # bouncing = ['  o   ', ' o    ', 'o     ', ' o    ', '  o   ', '   o  ', '    o ', '   o  ']
+    # ballspin = ['◐', '◓', '◑', '◒']
+    # periods = ['   ', '.  ', '.. ', '...']
+    spinner_symbols = itertools.cycle(spinner)
+    while not stop_event.is_set():
+        sys.stdout.write(f"\rPreparing preview image... {next(spinner_symbols)} ")  # Overwrite line
+        sys.stdout.flush()
+        time.sleep(0.1)
 
 def write_image(es_audio: es.audio.Audio, output_path: str = None, image_format: str = None,
                 width: int = None, height: int = None) -> str | None:
@@ -23,16 +52,29 @@ def write_image(es_audio: es.audio.Audio, output_path: str = None, image_format:
         file_format=image_format
     )
 
+    print()
+
+    # Use a thread to indicate to the user that we haven't crashed
+    stop_event = threading.Event()
+    spinner_thread = threading.Thread(target=spinner, args=(stop_event,))
+    spinner_thread.start()  # Start the spinner
+
     width = es.cfg['visualization.image.export.width'] if width is None else width
     height = es.cfg['visualization.image.export.height'] if height is None else height
 
-    visualization = es.visualization.Visualization(es_audio=es_audio, mode=es.visualization.VisualizationMode.EXPORT)
-    visualization.make_figure()
-    visualization.resize_figure(width=width, height=height, dpi=_DPI)
-
-    matplotlib.pyplot.savefig(image_file, dpi=_DPI, pil_kwargs={'optimize': True})
+    try:
+        visualization = es.visualization.Visualization(es_audio=es_audio, mode=es.visualization.VisualizationMode.EXPORT)
+        visualization.make_figure()
+        visualization.resize_figure(width=width, height=height, dpi=_DPI)
+        matplotlib.pyplot.savefig(image_file, dpi=_DPI, pil_kwargs={'optimize': True})
+    finally:
+        stop_event.set()                                            # Stop the spinner
+        spinner_thread.join()                                       # Wait for spinner thread to exit
+        sys.stdout.write("\rPreparing preview image... Done! \r") # Clear the spinner line
+        print()
 
     return image_file
+
 
 
 def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format: str = None,
@@ -43,6 +85,8 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
     frame_start = frame_start if frame_start is not None else es.cfg['visualization.video.frame-start']
     segment_start = segment_start if segment_start is not None else \
         es.cfg['visualization.video.segment-start'] if es.cfg['visualization.video.segment-start'] is not None else 1
+
+    enable_windows_virtual_terminal()
 
     # Determine the number of frames per segment
     frames_per_segment = es.cfg['visualization.video.export.segment-length'] * es.cfg['visualization.video.export.fps']
@@ -91,8 +135,6 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
 
     # Initialize list of video segment files
     video_segment_files = []
-
-    print('')
 
     # Gather previously processed files if resuming (not starting with the first segment)
     if segment_start > 1:
@@ -149,13 +191,17 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
                 if arg_value != '':
                     ffmpeg_extra_args.append(str(arg_value))
 
+    total_start_time = time.time()  # used in ETA calculation
+    global callback_time  # this must be defined as a global to be in scope for the callback
+    full_line_width = 140  # constant for full line width, determines whether to break up lines
+    if os.get_terminal_size().columns < full_line_width:
+        print('')
+
     # Create animation
     for video_segment_id in video_segment_ids:
         segment_time_start = time.time()
 
         if video_segment_id == 'preview':
-            print(f'Preparing preview segment')
-
             # Generate preview image file
             preview_image_file = write_image(
                 es_audio=es_audio,
@@ -163,7 +209,7 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
                     temp_file_name=f'{video_file_base}-videopreview.{image_format}'
                 ),
                 width=width,
-                height=height
+                height=height,
             )
 
             if not preview_image_file:
@@ -175,10 +221,7 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
             segment_frame_start = 0
 
             # Value of preview frames already accounts for case where preview is longer than the file
-            frame_count = preview_frames
-
-            def progress_callback(i, n):
-                return
+            segment_frame_count = preview_frames
         else:
             # Numeric video segment id
             try:
@@ -187,20 +230,76 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
                 print(f'Error: Unknown segment id "{video_segment_id}"')
                 return None
 
-            print(f'Preparing video segment {len(video_segment_files)}/{numeric_segments_total}:')
-
             segment_frame_start = (video_segment_number - 1) * frames_per_segment + preview_frames
-            frame_count = min(frames_total - segment_frame_start, frames_per_segment)
+            segment_frame_count = min(frames_total - segment_frame_start, frames_per_segment)
 
-            def progress_callback(i, n):
-                if i % es.cfg['visualization.video.export.fps'] == 0:
-                    print(
-                        f" Saving frame: {segment_frame_start + i}/{frames_total} ({i}/{n} in segment {current_segment}/{numeric_segments_total})")
+        def progress_callback(i, n):
+            global callback_time
+            if i == 1: # Calculate ETA from frame duration
+                callback_time = time.time() - callback_time
+            if i > 2:
+                # Smoothly update callback_time with a moving average
+                callback_time = ((callback_time * (i - 1)) + (time.time() - segment_time_start) / i) / i
+
+            # Estimate remaining time (ETA)
+            remaining_frames = segment_frame_count - i
+            segment_eta = "..." if i < 2 else f"{es.utils.seconds_to_string(callback_time * remaining_frames)}"
+            total_eta = "..." if i < 2 else f"{es.utils.seconds_to_string(callback_time * (frames_total - segment_frame_start - i))}"
+            time_elapsed = f"{es.utils.seconds_to_string(time.time() - total_start_time)}"
+
+            # Dynamic length calculation for printing
+            frame_width = len(f"{segment_frame_start + segment_frame_count}/{frames_total}")
+            eta_width = len(segment_eta)
+            elapsed_width = len(time_elapsed)
+            fps_width = len(f"{(1 / callback_time):2.1f}")
+
+            frame = f'{segment_frame_start + i:>3}/{frames_total} ({i:>3}/{n:>3} in segment)'
+            progress_percent = int((i / segment_frame_count) * 100) if i < segment_frame_count else 100
+
+            # Create progress bar using Unicode blocks
+            bar_length = 50
+            filled_length = progress_percent * bar_length // 100
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+
+            # Determine terminal size to know if we can fit the full pretty print line
+            try:
+                terminal_width = os.get_terminal_size().columns
+            except OSError:
+                terminal_width = 80  # default
+
+            # Break up pretty print if terminal is narrow
+            if terminal_width < full_line_width:
+                sys.stdout.write("\r\033[\033[F")  # Move cursor up to overwrite the first line (ANSI escape code)
+                sys.stdout.write(
+                    f"\r"
+                    f"{'Preview segment' if video_segment_id == 'preview' else f'Segment {current_segment}/{numeric_segments_total}': <20} "
+                    f"Frame: {frame: <{frame_width}}: {bar} {progress_percent: >3}%"
+                )
+                sys.stdout.write("\n")  # Go to the next line for additional stats
+                sys.stdout.write(
+                    f"\rTime elapsed: {time_elapsed: >{elapsed_width}}, "
+                    f"Segment ETA: {segment_eta: >{eta_width}}, "
+                    f"Total ETA: {total_eta: >{eta_width}}, "
+                    f"FPS: {(1 / callback_time): >{fps_width}.1f} "
+                )
+            else:  # we have the room to fit it on one line
+                sys.stdout.write(
+                    f"\r"
+                    f"{'Preview segment' if video_segment_id == 'preview' else f'Segment {current_segment}/{numeric_segments_total}': <20}"
+                    f"Frame: {frame: <{frame_width}}: "
+                    f"{bar} "
+                    f"{progress_percent: >3}%, "
+                    f"Time elapsed: {time_elapsed: >{elapsed_width}}, "
+                    f"Segment ETA: {segment_eta: >{eta_width}}, "
+                    f"Total ETA: {total_eta: >{eta_width}}, "
+                    f"FPS: {(1 / callback_time): >{fps_width}.1f} "
+                )
+            sys.stdout.flush()
 
         visualization = es.visualization.VideoVisualization(
             es_audio=es_audio,
             fps=fps,
-            frames=range(segment_frame_start, segment_frame_start + frame_count))
+            frames=range(segment_frame_start, segment_frame_start + segment_frame_count))
 
         visualization.make_figure()
         visualization.resize_figure(width=width, height=height, dpi=_DPI)
@@ -209,7 +308,7 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
             temp_file_name=f'{video_file_base}_{video_segment_id}.{video_format}'
         )
 
-        segment_length = frame_count * es.cfg["visualization.video.export.fps"]
+        segment_length = segment_frame_count * es.cfg["visualization.video.export.fps"]
 
         # The last frame of the segment must be a keyframe to allow concatenation without re-encoding
         ffmpeg_keyframe_args = [
@@ -217,13 +316,23 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
             f'expr:gte(t,{segment_length - 1 / es.cfg["visualization.video.export.fps"]})'
         ]
 
-        visualization.animation.save(
-            video_segment_file,
-            writer='ffmpeg',
-            fps=es.cfg['visualization.video.export.fps'],
-            codec=es.cfg['visualization.video.export.codec'],
-            extra_args=ffmpeg_extra_args + ffmpeg_keyframe_args,
-            progress_callback=progress_callback)
+        callback_time = time.time()  # initialize time used for ETA / FPS calculation
+        try:
+            sys.stdout.write("\033[?25l")  # Hide the cursor (ANSI escape code)
+            sys.stdout.flush()
+            visualization.animation.save(
+                video_segment_file,
+                writer='ffmpeg',
+                fps=es.cfg['visualization.video.export.fps'],
+                codec=es.cfg['visualization.video.export.codec'],
+                extra_args=ffmpeg_extra_args + ffmpeg_keyframe_args,
+                progress_callback=progress_callback)
+
+            # Call one last time to update progress bar to 100%
+            progress_callback(segment_frame_count, segment_frame_count)
+        finally:  # ensure we don't hide the cursor forever
+            sys.stdout.write("\033[?25h")  # Show the cursor (ANSI escape code)
+            sys.stdout.flush()
 
         video_segment_files.append(video_segment_file)
         es.utils.add_temp_file(video_segment_file)
@@ -260,17 +369,12 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
             current_segment += 1
 
         segment_time_length = time.time() - segment_time_start
-        segment_time_fps = frame_count / segment_time_length
-
-        print(
-            f'Wrote {frame_count} frames in {es.utils.seconds_to_string(seconds=segment_time_length)} ({segment_time_fps:.1f} FPS).')
-
-        # If not the preview or last segment, show estimated time remaining
-        if video_segment_id != 'preview' and video_segment_id != video_segment_ids[-1]:
-            print(
-                f'Estimated time remaining: {es.utils.seconds_to_string(seconds=(frames_total - segment_frame_start) / segment_time_fps)}')
+        segment_time_fps = segment_frame_count / segment_time_length
 
         print('')
+        if os.get_terminal_size().columns < full_line_width:
+            # If the terminal is too narrow, need to skip an extra line
+            print('')
 
     # Prepare final video file
 
@@ -302,6 +406,7 @@ def write_video(es_audio: es.audio.Audio, output_path: str = None, video_format:
         video_file
     ]
 
+    print('')
     print(f'Combining segments into final video file.')
 
     # Debug print for constructed command
